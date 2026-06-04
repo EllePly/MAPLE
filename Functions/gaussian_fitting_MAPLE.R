@@ -1,10 +1,16 @@
 # Gaussian fitting functions for MAPLE
 #
 # These functions are adapted from the Gaussian fitting workflow implemented
-# in PrInCE. MAPLE extends this workflow by adding configurable R2 and RMSE
-# fit-quality filtering, flexible pass rules, optimisation by either RMSE or R2,
-# user-selectable initialisation modes, and additional Gaussian component
-# filters based on peak height, centre and variance.
+# in PrInCE and extended for MAPLE analysis.
+#
+# MAPLE-specific extensions include:
+#   - R2-based fit filtering
+#   - RMSE-based fit filtering
+#   - flexible pass rules using either or both R2 and RMSE
+#   - optimisation by RMSE or R2
+#   - random or guessed initialisation
+#   - Gaussian component filtering by height, centre and variance
+#   - early stopping once a fit passes the user-defined quality criteria
 #
 # Required packages:
 #   PrInCE
@@ -15,26 +21,6 @@ library(PrInCE)
 library(purrr)
 library(progress)
 
-# Convert fraction names such as F38, F39, F40 into numeric indices.
-get_fraction_index <- function(chromatogram) {
-  frac_names <- names(chromatogram)
-  
-  if (is.null(frac_names)) {
-    return(seq_along(chromatogram))
-  }
-  
-  frac_index <- suppressWarnings(as.numeric(gsub("^F", "", frac_names)))
-  
-  if (any(is.na(frac_index))) {
-    return(seq_along(chromatogram))
-  }
-  
-  frac_index
-}
-
-# Fit a Gaussian mixture model to one protein elution profile.
-# MAPLE-specific extensions include R2/RMSE filtering, flexible pass rules,
-# optimisation by RMSE or R2, and selectable initialisation strategy.
 
 fit_gaussians_maple <- function(
     chromatogram,
@@ -68,7 +54,7 @@ fit_gaussians_maple <- function(
   while (iter < max_iterations && !bestPass) {
     iter <- iter + 1
     
-    initial_conditions <- PrInCE:::make_initial_conditions(
+    initial_conditions <- make_initial_conditions(
       chromatogram,
       n_gaussians,
       method
@@ -98,6 +84,8 @@ fit_gaussians_maple <- function(
       )
     }, error = function(e) {
       e
+    }, simpleError = function(e) {
+      e
     })
     
     if ("error" %in% class(fit)) next
@@ -109,37 +97,45 @@ fit_gaussians_maple <- function(
     if (filter_gaussians_variance_min > 0) {
       sigmas <- coefs[["sigma"]]
       drop <- which(sigmas < filter_gaussians_variance_min)
-      if (length(drop) > 0) coefs <- lapply(coefs, `[`, -drop)
+      if (length(drop) > 0) {
+        coefs <- lapply(coefs, `[`, -drop)
+      }
     }
     
     if (filter_gaussians_variance_max > 0) {
       sigmas <- coefs[["sigma"]]
       drop <- which(sigmas > filter_gaussians_variance_max)
-      if (length(drop) > 0) coefs <- lapply(coefs, `[`, -drop)
+      if (length(drop) > 0) {
+        coefs <- lapply(coefs, `[`, -drop)
+      }
     }
     
     if (filter_gaussians_center) {
       means <- coefs[["mu"]]
-      drop <- which(means < min(indices) | means > max(indices))
-      if (length(drop) > 0) coefs <- lapply(coefs, `[`, -drop)
+      drop <- which(means < 0 | means > length(chromatogram))
+      if (length(drop) > 0) {
+        coefs <- lapply(coefs, `[`, -drop)
+      }
     }
     
     if (filter_gaussians_height > 0) {
-      minHeight <- max(chromatogram, na.rm = TRUE) * filter_gaussians_height
+      minHeight <- max(chromatogram) * filter_gaussians_height
       heights <- coefs[["A"]]
       drop <- which(heights < minHeight)
-      if (length(drop) > 0) coefs <- lapply(coefs, `[`, -drop)
+      if (length(drop) > 0) {
+        coefs <- lapply(coefs, `[`, -drop)
+      }
     }
     
-    if (length(coefs[[1]]) == 0) next
+    if (length(first(coefs)) == 0) next
     
-    curveFit <- PrInCE:::fit_curve(coefs, indices)
+    curveFit <- fit_curve(coefs, indices)
     
-    R2 <- suppressWarnings(cor(chromatogram, curveFit, use = "pairwise.complete.obs")^2)
+    R2 <- cor(chromatogram, curveFit)^2
     RMSE <- sqrt(mean((chromatogram - curveFit)^2, na.rm = TRUE))
     
-    pass_R2 <- (!use_R_squared) || (!is.na(R2) && R2 >= min_R_squared)
-    pass_RMSE <- (!use_RMSE) || (!is.na(RMSE) && RMSE <= max_RMSE)
+    pass_R2 <- (!use_R_squared) || (R2 >= min_R_squared)
+    pass_RMSE <- (!use_RMSE) || (RMSE <= max_RMSE)
     
     if (pass_rule == "both") {
       pass_current <- pass_R2 && pass_RMSE
@@ -167,14 +163,22 @@ fit_gaussians_maple <- function(
   }
   
   if (!is.null(bestCoefs)) {
-    curveFit <- PrInCE:::fit_curve(bestCoefs, indices)
+    curveFit <- fit_curve(bestCoefs, indices)
   } else {
     curveFit <- NULL
     bestR2 <- NA_real_
     bestRMSE <- NA_real_
   }
   
-  list(
+  cols <- names(chromatogram)
+  frac <- as.numeric(sub("^F", "", cols))
+  offset <- min(frac) - 1
+  
+  if (!is.null(bestCoefs)) {
+    bestCoefs$mu <- bestCoefs$mu + offset
+  }
+  
+  results <- list(
     n_gaussians = n_gaussians,
     R2 = bestR2,
     RMSE = bestRMSE,
@@ -182,6 +186,8 @@ fit_gaussians_maple <- function(
     coefs = bestCoefs,
     curveFit = curveFit
   )
+  
+  return(results)
 }
 
 
@@ -231,20 +237,22 @@ choose_gaussians_maple <- function(
     )
   }
   
-  models <- purrr::map(fits, "coefs")
-  drop <- purrr::map_lgl(models, is.null)
+  models <- map(fits, "coefs")
+  drop <- map_lgl(models, is.null)
   fits <- fits[!drop]
   
-  if (length(fits) == 0) return(NULL)
+  if (length(fits) == 0) {
+    return(NULL)
+  }
   
-  coefs <- purrr::map(fits, "coefs")
+  coefs <- map(fits, "coefs")
   
   if (criterion == "AICc") {
-    criteria <- lapply(coefs, PrInCE:::gaussian_aicc, chromatogram)
+    criteria <- lapply(coefs, gaussian_aicc, chromatogram)
   } else if (criterion == "AIC") {
-    criteria <- lapply(coefs, PrInCE:::gaussian_aic, chromatogram)
+    criteria <- lapply(coefs, gaussian_aic, chromatogram)
   } else if (criterion == "BIC") {
-    criteria <- lapply(coefs, PrInCE:::gaussian_bic, chromatogram)
+    criteria <- lapply(coefs, gaussian_bic, chromatogram)
   }
   
   best <- which.min(criteria)
@@ -285,13 +293,13 @@ build_gaussians_maple <- function(
     profile_matrix <- exprs(profile_matrix)
   }
   
-  filtered <- PrInCE:::filter_profiles(
+  filtered <- filter_profiles(
     profile_matrix,
     min_points = min_points,
     min_consecutive = min_consecutive
   )
   
-  cleaned <- PrInCE:::clean_profiles(
+  cleaned <- clean_profiles(
     filtered,
     impute_NA = impute_NA,
     smooth = smooth,
@@ -309,7 +317,7 @@ build_gaussians_maple <- function(
   
   if (show_progress) {
     message(".. fitting Gaussian mixture models to ", P, " profiles")
-    pb <- progress::progress_bar$new(
+    pb <- progress_bar$new(
       format = "fitting :what [:bar] :percent eta: :eta",
       clear = FALSE,
       total = P,
@@ -354,3 +362,15 @@ build_gaussians_maple <- function(
   
   return(gaussians)
 }
+
+
+# Assign functions to the PrInCE namespace.
+# This is required because several helper functions used above
+# are internal to PrInCE.
+environment(build_gaussians_maple) <- asNamespace("PrInCE")
+ns <- asNamespace("PrInCE")
+
+environment(get_fraction_index) <- ns
+environment(fit_gaussians_maple) <- ns
+environment(choose_gaussians_maple) <- ns
+environment(build_gaussians_maple) <- ns
