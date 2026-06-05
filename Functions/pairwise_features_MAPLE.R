@@ -177,8 +177,9 @@ calculate_pairwise_features_maple <- function(
     profile_flip <- data.frame(t(profile_matrix))
     profile_for_cosine <- as.matrix(profile_flip)
     cosine_sim <- lsa::cosine(profile_for_cosine)
-    feature_matrices[["cosine_sim"]] <- cosine_sim
-    message("cosine_correlation finished")
+    cosine_distance <- 1 - cosine_sim
+    feature_matrices[["cosine_distance"]] <- cosine_distance
+    message("cosine_distance finished")
   }
   
   if (euclidean_distance) {
